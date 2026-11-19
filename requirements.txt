@@ -1,0 +1,6 @@
+numpy
+scipy
+matplotlib
+pandas
+numba        # optional but strongly recommended (ODE runs ~100x faster)
+jupyter
