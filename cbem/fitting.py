@@ -8,7 +8,7 @@ from scipy.optimize import minimize
 
 from .config import FAST_PASSES, FS_OUT, FULL_PASSES, MAXFUN, PASS_PRESETS
 from .data import balanced_subset, make_design_matrix, train_val_segments
-from .model import filters, make_p0, n_params, nll_segments
+from .model import filters, make_p0, n_params, nll_and_grad_segments, nll_segments
 
 try:  # progress bars: tqdm.auto gives a widget in Jupyter, text in a terminal
     from tqdm.auto import tqdm
@@ -86,14 +86,17 @@ def fit_neuron(Xd, Y, segments, fl, hl, dt, biophys, lambda_l2=0.0,
     last = {'loss': np.nan, 'evals': 0}
 
     def obj(p):
-        v = (nll_segments(p, Xd, Yf, segments, fl, hl, dt, biophys)
-             + lambda_l2 * np.sum(p[:4 * fl] ** 2))
+        # Exact gradient (adjoint): one model run per evaluation instead of
+        # ~n_params runs for scipy's finite differences.
+        v, g = nll_and_grad_segments(p, Xd, Yf, segments, fl, hl, dt, biophys)
+        v += lambda_l2 * np.sum(p[:4 * fl] ** 2)
+        g[:4 * fl] += 2 * lambda_l2 * p[:4 * fl]
         last['evals'] += 1
         last['loss'] = v if not np.isfinite(last['loss']) else min(last['loss'], v)
-        return v
+        return v, g
 
     p0 = make_p0(fl, hl)
-    loss0 = obj(p0)
+    loss0 = obj(p0)[0]
     best, log = None, []
     for i, (maxiter, ftol, gtol) in enumerate(passes):
         start = p0 if best is None else best.x
@@ -109,7 +112,7 @@ def fit_neuron(Xd, Y, segments, fl, hl, dt, biophys, lambda_l2=0.0,
 
         t0 = time.perf_counter()
         try:
-            r = minimize(obj, start, method='L-BFGS-B', options=opts, callback=callback)
+            r = minimize(obj, start, method='L-BFGS-B', jac=True, options=opts, callback=callback)
         finally:
             bar.close()
         secs = time.perf_counter() - t0

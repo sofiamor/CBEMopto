@@ -27,11 +27,22 @@ WINDOWS = {'single': 0.030, 'train': 0.100}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-def light_onsets(stim):
+# For trains only the FIRST pulse of each train is an onset: pulses inside a
+# 100 Hz train are 10 ms apart, so a 100 ms window per pulse would put the
+# previous pulses' response into the "pre" baseline and cancel the response.
+MIN_GAP_S = 0.050
+
+
+def light_onsets(stim, min_gap=0):
     """Indices where the laser goes 0 -> 1 (a block that starts with the laser
-    already on counts its first sample as an onset)."""
+    already on counts its first sample as an onset). With min_gap > 0 (samples),
+    an onset closer than min_gap to the previous one is dropped, so a train
+    gives one onset."""
     s = np.asarray(stim).astype(np.int8)
-    return np.flatnonzero(np.diff(np.r_[0, s]) == 1)
+    on = np.flatnonzero(np.diff(np.r_[0, s]) == 1)
+    if min_gap > 0 and len(on):
+        on = on[np.r_[True, np.diff(on) >= min_gap]]
+    return on
 
 
 def light_duration_ms(stim, fs):
@@ -118,7 +129,8 @@ def observed_modulation(raw, fs=FS_ACQ, neurons=None, n_boot=2000, seed=0,
     rng = np.random.default_rng(seed)
 
     blocks = {p: np.flatnonzero(prot == p) for p in range(1, 7)}
-    onsets = {p: light_onsets(stim[idx]) for p, idx in blocks.items()}
+    gap = int(MIN_GAP_S * fs)
+    onsets = {p: light_onsets(stim[idx], gap) for p, idx in blocks.items()}
     light = {p: light_duration_ms(stim[idx], fs) for p, idx in blocks.items()}
 
     rows = []
@@ -187,7 +199,7 @@ def model_modulation(params, fl, hl, X, protocol, dt, biophys, make_design_matri
         idx = np.flatnonzero(protocol == p_sim)
         if len(idx) == 0:
             continue
-        on = idx[light_onsets(X[idx, 0])]
+        on = idx[light_onsets(X[idx, 0], int(round(MIN_GAP_S / dt)))]
         pad = fl  # stimulus history the filters need before the window
         resp = {'sim': [], 'mc': [], 'vc': []}
         for o in on:

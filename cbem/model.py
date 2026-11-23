@@ -114,3 +114,84 @@ def nll_segments(params, Xd, Y, segments, fl, hl, dt, biophys):
     voltage at V0 and the spike history at zero."""
     return sum(nll(params, Xd[a:b], Y[a:b], fl, hl, dt, biophys)
                for a, b in segments)
+
+
+# ── analytic gradient (adjoint through the exponential-Euler recursion) ─────
+def _sigmoid(x):
+    return 0.5 * (1.0 + np.tanh(0.5 * x))
+
+
+def _euler_adjoint_numpy(gV, V, alpha, V_inf, lag):
+    """Back-propagate dL/dV through V[t] = alpha[s] V[t-1] + (1-alpha[s]) V_inf[s],
+    s = t - lag. Returns dL/dalpha and dL/dV_inf (indexed like alpha / V_inf)."""
+    T = len(V)
+    g_alpha = np.zeros(T)
+    g_vinf = np.zeros(T)
+    adj = 0.0
+    for t in range(T - 1, 0, -1):
+        adj = adj + gV[t]                      # total dL/dV[t]
+        s = t - lag
+        g_alpha[s] += adj * (V[t - 1] - V_inf[s])
+        g_vinf[s] += adj * (1.0 - alpha[s])
+        adj = adj * alpha[s]                   # carried back to V[t-1]
+    return g_alpha, g_vinf
+
+
+if HAS_NUMBA:
+    _euler_adjoint = numba.njit(cache=True)(_euler_adjoint_numpy)
+else:
+    _euler_adjoint = _euler_adjoint_numpy
+
+
+def nll_and_grad(params, Xd, Y, fl, hl, dt, biophys, lag=ODE_CONDUCTANCE_LAG):
+    """Negative log-likelihood of ONE segment and its exact gradient."""
+    p = unpack(params, fl, hl)
+    El, Ee, Ei = biophys['El'], biophys['Ee'], biophys['Ei']
+    gl, Cm = biophys['gl'], biophys['Cm']
+
+    ue = Xd @ p['k_e'] + p['dc_e']
+    ui = Xd @ p['k_i'] + p['dc_i']
+    ge, gi = softplus(ue), softplus(ui)
+    g_tot = gl + ge + gi
+    V_inf = (gl * El + ge * Ee + gi * Ei) / g_tot
+    alpha = np.exp(-dt * g_tot / Cm)
+    V = integrate_voltage(ge, gi, biophys, dt, lag)
+
+    h_contrib = history_contribution(Y, p['h'])
+    z = p['a'] * (V - p['vth']) + h_contrib
+    lam_raw = softplus(z) * dt
+    lam = np.clip(lam_raw, 1e-10, 1.0 - 1e-10)
+    loss = -np.sum(Y * np.log(lam) + (1 - Y) * np.log1p(-lam))
+
+    inside = (lam_raw > 1e-10) & (lam_raw < 1.0 - 1e-10)
+    g_lam = np.where(inside, -Y / lam + (1 - Y) / (1 - lam), 0.0)
+    g_z = g_lam * _sigmoid(z) * dt
+
+    grad = np.zeros_like(params, dtype=float)
+    o = 4 * fl + hl
+    grad[o + 2] = np.sum(g_z * (V - p['vth']))          # a
+    grad[o + 3] = -p['a'] * np.sum(g_z)                 # Vth
+    T = len(Y)
+    Ypad = np.concatenate([np.zeros(hl), Y])
+    for l in range(hl):                                 # history filter
+        grad[4 * fl + l] = g_z @ Ypad[hl - 1 - l: T + hl - 1 - l]
+
+    g_alpha, g_vinf = _euler_adjoint(p['a'] * g_z, V, alpha, V_inf, lag)
+    g_ge = g_alpha * alpha * (-dt / Cm) + g_vinf * (Ee - V_inf) / g_tot
+    g_gi = g_alpha * alpha * (-dt / Cm) + g_vinf * (Ei - V_inf) / g_tot
+    g_ue = g_ge * _sigmoid(ue)
+    g_ui = g_gi * _sigmoid(ui)
+    grad[:2 * fl] = Xd.T @ g_ue
+    grad[2 * fl:4 * fl] = Xd.T @ g_ui
+    grad[o] = g_ue.sum()
+    grad[o + 1] = g_ui.sum()
+    return loss, grad
+
+
+def nll_and_grad_segments(params, Xd, Y, segments, fl, hl, dt, biophys):
+    loss, grad = 0.0, np.zeros(len(params))
+    for a, b in segments:
+        l, g = nll_and_grad(params, Xd[a:b], Y[a:b], fl, hl, dt, biophys)
+        loss += l
+        grad += g
+    return loss, grad
