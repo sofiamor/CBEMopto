@@ -169,7 +169,7 @@ directly comparable. Validation ≫ train ⇒ overfitting (shorten `filter_len` 
 
 ---
 
-## 8. What changed vs. the earlier notebooks
+<!-- ## 8. What changed vs. the earlier notebooks
 
 **Real bugs fixed**
 * `spk1_1k / spk2_1k / spk3_1k` were never defined (NameError) → all spike access goes
@@ -199,7 +199,7 @@ directly comparable. Validation ≫ train ⇒ overfitting (shorten `filter_len` 
 * **Filter statistics:** dominant lobe = largest |value| (a larger negative lobe used to be
   ignored).
 * No reliance on notebook globals (`best_lambda`, `fl`, `hl`, ...): everything is passed
-  explicitly.
+  explicitly. -->
 
 ---
 

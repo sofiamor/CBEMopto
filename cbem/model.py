@@ -21,7 +21,7 @@ except ImportError:  # pure-numpy fallback is slower but identical
 
 
 def softplus(x):
-    return np.log1p(np.exp(np.clip(x, -50, 50)))
+    return np.logaddexp(0, x) 
 
 
 def n_params(fl, hl):

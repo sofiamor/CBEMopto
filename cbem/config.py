@@ -37,6 +37,26 @@ DEFAULT_VAL_FRAC = 0.20
 # original notebook's likelihood exactly (checked numerically).
 ODE_CONDUCTANCE_LAG = 0
 
-# (maxiter, ftol, gtol) for successive L-BFGS-B passes
-FULL_PASSES = [(2000, 1e-5, 1e-4), (3000, 1e-7, 1e-6), (5000, 1e-9, 1e-7)]
-FAST_PASSES = [(2000, 1e-5, 1e-4)]
+# ── optimizer settings ───────────────────────────────────────────────────────
+# A fit runs one or more L-BFGS-B "passes" in order; each pass starts from the
+# best result so far. Each pass is (maxiter, ftol, gtol):
+#   maxiter  max number of iterations in that pass
+#   ftol     stop when one iteration improves the loss by less than this (relative)
+#   gtol     stop when the largest gradient component is smaller than this
+# A pass stops at whichever limit is hit first (r.message says which).
+#
+# Pick a preset by name anywhere a `passes` argument exists, e.g.
+#   fit_all(..., passes='quick')   or   passes=[(500, 1e-6, 1e-5)]
+PASS_PRESETS = {
+    'quick': [(200, 1e-5, 1e-4)],                                        # smoke test
+    'fast':  [(2000, 1e-5, 1e-4)],                                       # grid search
+    'full':  [(2000, 1e-5, 1e-4), (3000, 1e-7, 1e-6), (5000, 1e-9, 1e-7)],
+}
+FULL_PASSES = PASS_PRESETS['full']
+FAST_PASSES = PASS_PRESETS['fast']
+
+# Max model evaluations per pass. scipy's default is 15000, but without an
+# analytic gradient every iteration costs (n_params + 1) evaluations
+# (~635 with fl=150, hl=30), so the default silently stops each pass after
+# ~15-25 iterations, long before maxiter. None = no limit (maxiter decides).
+MAXFUN = None

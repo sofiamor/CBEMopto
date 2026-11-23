@@ -1,13 +1,63 @@
 """Fitting, cross-validation and hyper-parameter search."""
 import itertools
 import pickle
+import time
 
 import numpy as np
 from scipy.optimize import minimize
 
-from .config import FAST_PASSES, FS_OUT, FULL_PASSES
+from .config import FAST_PASSES, FS_OUT, FULL_PASSES, MAXFUN, PASS_PRESETS
 from .data import balanced_subset, make_design_matrix, train_val_segments
-from .model import filters, make_p0, nll_segments
+from .model import filters, make_p0, n_params, nll_segments
+
+try:  # progress bars: tqdm.auto gives a widget in Jupyter, text in a terminal
+    from tqdm.auto import tqdm
+except ImportError:  # fall back to a plain one-line text bar
+    tqdm = None
+
+
+class _TextBar:
+    """Minimal stand-in for tqdm when it is not installed."""
+
+    def __init__(self, total, desc='', disable=False, **_):
+        self.total, self.desc, self.n, self.disable = total, desc, 0, disable
+        self.t0, self.post = time.perf_counter(), ''
+
+    def update(self, k=1):
+        self.n += k
+        if self.disable:
+            return
+        el = time.perf_counter() - self.t0
+        rate = el / self.n
+        print(f'\r{self.desc}: {self.n}/{self.total} it | {_hms(el)} elapsed | '
+              f'{rate:.1f}s/it | max left {_hms(rate * (self.total - self.n))} '
+              f'| {self.post}   ', end='', flush=True)
+
+    def set_postfix_str(self, s):
+        self.post = s
+
+    def close(self):
+        if not self.disable:
+            print()
+
+
+def _hms(sec):
+    sec = int(sec)
+    return f'{sec // 3600}h{sec % 3600 // 60:02d}m' if sec >= 3600 else f'{sec // 60}m{sec % 60:02d}s'
+
+
+def _bar(**kw):
+    return tqdm(**kw) if tqdm is not None else _TextBar(**kw)
+
+
+def resolve_passes(passes):
+    """Accept a preset name ('quick', 'fast', 'full') or a list of
+    (maxiter, ftol, gtol) tuples."""
+    if isinstance(passes, str):
+        if passes not in PASS_PRESETS:
+            raise ValueError(f'Unknown preset {passes!r}; choose from {list(PASS_PRESETS)}')
+        return PASS_PRESETS[passes]
+    return list(passes)
 
 
 def scale_lambda(lam, n_bins_search, n_bins_full):
@@ -18,43 +68,124 @@ def scale_lambda(lam, n_bins_search, n_bins_full):
 
 
 def fit_neuron(Xd, Y, segments, fl, hl, dt, biophys, lambda_l2=0.0,
-               passes=FULL_PASSES, verbose=True, name='neuron'):
-    """Multi-pass L-BFGS-B. L2 penalty acts on the stimulus filters only."""
+               passes=FULL_PASSES, verbose=True, name='neuron', maxfun=MAXFUN,
+               progress=True):
+    """Multi-pass L-BFGS-B. L2 penalty acts on the stimulus filters only.
+
+    passes:   preset name ('quick', 'fast', 'full') or list of (maxiter, ftol, gtol).
+    maxfun:   max model evaluations per pass (None = no limit, see config.MAXFUN).
+    progress: show a progress bar per pass. The bar counts iterations up to
+              maxiter, so its time estimate is a WORST case: most passes stop
+              earlier, when the loss stops improving (ftol). Watch 's/it' and
+              the loss in the bar: once the loss barely changes, the pass is
+              about to end.
+    The result includes 'log': one entry per pass with loss, iterations,
+    evaluations, seconds and the reason the pass stopped."""
+    passes = resolve_passes(passes)
     Yf = Y.astype(float)
+    last = {'loss': np.nan, 'evals': 0}
 
     def obj(p):
-        return (nll_segments(p, Xd, Yf, segments, fl, hl, dt, biophys)
-                + lambda_l2 * np.sum(p[:4 * fl] ** 2))
+        v = (nll_segments(p, Xd, Yf, segments, fl, hl, dt, biophys)
+             + lambda_l2 * np.sum(p[:4 * fl] ** 2))
+        last['evals'] += 1
+        last['loss'] = v if not np.isfinite(last['loss']) else min(last['loss'], v)
+        return v
 
     p0 = make_p0(fl, hl)
     loss0 = obj(p0)
-    best = None
+    best, log = None, []
     for i, (maxiter, ftol, gtol) in enumerate(passes):
         start = p0 if best is None else best.x
-        r = minimize(obj, start, method='L-BFGS-B',
-                     options={'maxiter': maxiter, 'ftol': ftol, 'gtol': gtol})
+        opts = {'maxiter': maxiter, 'ftol': ftol, 'gtol': gtol,
+                'maxfun': maxfun if maxfun is not None else 10**12}
+        bar = _bar(total=maxiter, desc=f'{name} pass {i + 1}/{len(passes)}',
+                   unit='it', disable=not progress, leave=True)
+        ev0 = last['evals']
+
+        def callback(xk):  # scipy calls this once per finished iteration
+            bar.set_postfix_str(f'loss={last["loss"]:.2f} evals={last["evals"] - ev0}')
+            bar.update(1)
+
+        t0 = time.perf_counter()
+        try:
+            r = minimize(obj, start, method='L-BFGS-B', options=opts, callback=callback)
+        finally:
+            bar.close()
+        secs = time.perf_counter() - t0
+        log.append({'pass': i + 1, 'maxiter': maxiter, 'ftol': ftol, 'gtol': gtol,
+                    'loss': float(r.fun), 'nit': int(r.nit), 'nfev': int(r.nfev),
+                    'secs': secs, 'success': bool(r.success), 'message': str(r.message)})
         if best is None or r.fun < best.fun:
             best = r
         if verbose:
-            print(f'  {name} pass {i + 1}: loss={r.fun:.2f} nit={r.nit} ok={r.success}')
+            print(f'  {name} pass {i + 1}: loss={r.fun:.2f} nit={r.nit} nfev={r.nfev} '
+                  f'{secs:.0f}s | {r.message}')
     if verbose:
-        print(f'  {name}: loss {loss0:.1f} -> {best.fun:.1f}')
+        print(f'  {name}: loss {loss0:.1f} -> {best.fun:.1f} '
+              f'({sum(e["secs"] for e in log):.0f}s total)')
     return {
         'params': best.x,
         'neg_LL': nll_segments(best.x, Xd, Yf, segments, fl, hl, dt, biophys),
         'success': best.success,
         'fl': fl, 'hl': hl, 'lambda_l2': lambda_l2,
+        'loss0': float(loss0), 'log': log,
     }
 
 
-def fit_all(fit, Xd, fl, hl, dt, biophys, lambda_l2=0.0, passes=FULL_PASSES):
+def compare_passes(Xd, Y, segments, fl, hl, dt, biophys, settings,
+                   lambda_l2=0.0, maxfun=MAXFUN, name='neuron'):
+    """Fit ONE neuron with several optimizer settings and print a comparison,
+    to see whether more iterations actually lower the loss or only take longer.
+
+    settings: dict {label: preset name or list of (maxiter, ftol, gtol)}, e.g.
+        {'quick': 'quick',
+         '500 it': [(500, 1e-6, 1e-5)],
+         'full': 'full'}
+    Tip: run it on a short subset first; each fit costs ~(n_params + 1)
+    model evaluations per iteration."""
+    print(f'{name}: {n_params(fl, hl)} parameters, '
+          f'{sum(b - a for a, b in segments)} bins')
+    rows = {}
+    for label, passes in settings.items():
+        res = fit_neuron(Xd, Y, segments, fl, hl, dt, biophys, lambda_l2,
+                         passes, verbose=False, name=name, maxfun=maxfun)
+        log = res['log']
+        rows[label] = {'loss': res['neg_LL'],
+                       'nit': sum(e['nit'] for e in log),
+                       'nfev': sum(e['nfev'] for e in log),
+                       'secs': sum(e['secs'] for e in log),
+                       'stopped': log[-1]['message'], 'params': res['params']}
+    best_loss = min(r['loss'] for r in rows.values())
+    print(f'\n{"setting":<14}{"neg_LL":>12}{"vs best":>10}{"iters":>8}'
+          f'{"evals":>10}{"time":>9}  last pass stopped because')
+    for label, r in rows.items():
+        print(f'{label:<14}{r["loss"]:>12.2f}{r["loss"] - best_loss:>10.2f}'
+              f'{r["nit"]:>8}{r["nfev"]:>10}{r["secs"]:>8.0f}s  {r["stopped"]}')
+    print('\n"vs best" = extra loss compared with the best setting. '
+          'Differences below ~1 are negligible.')
+    return rows
+
+
+def fit_all(fit, Xd, fl, hl, dt, biophys, lambda_l2=0.0, passes=FULL_PASSES,
+            progress=True):
+    """Fit every neuron. With progress=True an overall bar counts neurons; after
+    the first neuron its time estimate is a fair guess for the whole file."""
     results = {}
-    for name, Y in fit.spikes.items():
-        print(f'Fitting {name} ({int(Y.sum())} spikes, {Y.sum() / (len(Y) * dt):.1f} Hz)')
-        res = fit_neuron(Xd, Y, fit.segments, fl, hl, dt, biophys,
-                         lambda_l2, passes, name=name)
-        res.update(filters(res['params'], fl, hl))
-        results[name] = res
+    names = list(fit.spikes)
+    overall = _bar(total=len(names), desc='neurons', unit='neuron',
+                   disable=not progress or len(names) < 2, leave=True)
+    try:
+        for name in names:
+            Y = fit.spikes[name]
+            print(f'Fitting {name} ({int(Y.sum())} spikes, {Y.sum() / (len(Y) * dt):.1f} Hz)')
+            res = fit_neuron(Xd, Y, fit.segments, fl, hl, dt, biophys,
+                             lambda_l2, passes, name=name, progress=progress)
+            res.update(filters(res['params'], fl, hl))
+            results[name] = res
+            overall.update(1)
+    finally:
+        overall.close()
     return results
 
 
@@ -132,7 +263,7 @@ def grid_search(fit, grid, dt, biophys, search_neurons=None, search_secs=60,
             per = {}
             for n in eligible:
                 res = fit_neuron(Xd, sub.spikes[n], tr, fl, hl, dt, biophys, lam,
-                                 passes, verbose=False, name=n)
+                                 passes, verbose=False, name=n, progress=False)
                 val = nll_segments(res['params'], Xd, sub.spikes[n].astype(float),
                                    vl, fl, hl, dt, biophys)
                 per[n] = val / n_vl_spk[n]
